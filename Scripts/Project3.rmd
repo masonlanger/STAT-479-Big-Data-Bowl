@@ -1,0 +1,548 @@
+---
+title: "STAT 479 Project 3 - NFL Big Data Bowl"
+output: html_document
+---
+
+# Calculate Air-Time Separation Score (ATS-Score)
+The ATS-Score quantifies a receiver's ability to create and maintain separation from the nearest defender while the ball is in the air. It is the time-averaged minimum separation between the targeted receiver and the closest defensive player during the pass flight.
+
+### Loading and Merging Data
+```{r setup, include=FALSE}
+# Hide setup code when knitting
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(dplyr)
+
+data_path = "../Datasets" 
+
+# 1. Load all input tracking data (pre-pass)
+input_files = list.files(
+  path = data_path,
+  pattern = "^input_2023_w\\d{2}\\.csv$",
+  full.names = TRUE
+)
+
+df_input_all = input_files %>%
+  map_dfr(read_csv)
+
+# 2. Load all output tracking data (post-pass)
+output_files = list.files(
+  path = data_path,
+  pattern = "^output_2023_w\\d{2}\\.csv$",
+  full.names = TRUE
+)
+
+df_output_all = output_files %>%
+  map_dfr(read_csv)
+
+# 3. Load supplementary play data
+df_plays = read_csv(file.path(data_path, "supplementary_data.csv"))
+
+# Confirm data loading and inspect structure
+cat("Dimensions of df_input_all (all weeks pre-pass data):", dim(df_input_all), "\n")
+cat("Dimensions of df_output_all (all weeks post-pass data):", dim(df_output_all), "\n")
+cat("Dimensions of df_plays (supplementary data):", dim(df_plays), "\n")
+
+# Display the first few rows of the input data for a quick check
+df_input_all %>% head() %>% print()
+```
+
+
+### Prepare Tracking Data for Separation Calculation
+```{r}
+
+# 1. Create a unique play/player ID to help with grouping and joining
+df_output_all = df_output_all %>%
+  mutate(play_player_id = paste(game_id, play_id, nfl_id, sep = "_"))
+
+# 2. Extract key player information and roles from the input data.
+# We only need one row per player per play to get their role so using the last frame of the input is sufficient to define player roles/sides.
+df_player_roles = df_input_all %>%
+  distinct(game_id, play_id, nfl_id, player_side, player_role) %>%
+  # Filter only for the players relevant to the score: Targeted Receiver and Defensive Coverage
+  filter(player_role %in% c("Targeted Receiver", "Defensive Coverage"))
+
+# 3. Join player roles and side onto the output (post-pass) tracking data.
+df_tracking_prepared = df_output_all %>%
+  left_join(df_player_roles, by = c("game_id", "play_id", "nfl_id")) %>%
+  # Filter out rows where the join failed (e.g., non-receiver/defender players)
+  filter(!is.na(player_role))
+
+# 4. Separate the receiver's tracking data from the defenders' tracking data.
+df_receiver_tracking = df_tracking_prepared %>%
+  filter(player_role == "Targeted Receiver") %>%
+  dplyr::select(game_id, play_id, frame_id, receiver_x = x, receiver_y = y)
+
+df_defender_tracking = df_tracking_prepared %>%
+  filter(player_role == "Defensive Coverage") %>%
+  # Rename columns for clarity in the subsequent separation calculation
+  rename(defender_x = x, defender_y = y) %>%
+  dplyr::select(game_id, play_id, nfl_id, frame_id, defender_x, defender_y)
+
+# Print dimensions of the key intermediate dataframes
+cat("Dimensions of df_tracking_prepared:", dim(df_tracking_prepared), "\n")
+cat("Dimensions of df_receiver_tracking:", dim(df_receiver_tracking), "\n")
+cat("Dimensions of df_defender_tracking:", dim(df_defender_tracking), "\n")
+
+# Display head of the receiver tracking data
+df_receiver_tracking %>% head() %>% print()
+```
+
+### Frame-by-Frame Minimum Separation
+Join the receiver and defender tracking data, calculates the Euclidean distance (separation) for every receiver-defender pair in every frame, and identifies the minimum separation distance for each frame of every play. The forumula for the distance separation is $$\text{Separation Distance} = \sqrt{(\text{Receiver}_x - \text{Defender}_x)^2 + (\text{Receiver}_y - \text{Defender}_y)^2}$$
+```{r}
+# 1. Join Receiver and Defender Tracking Data
+# This is a Cartesian join based on Game, Play, and Frame, pairing the single receiver position with all defender positions for that moment in time.
+df_all_separation = df_receiver_tracking %>%
+  left_join(df_defender_tracking, by = c("game_id", "play_id", "frame_id")) %>%
+  # Filter out plays where no defender was present in the output data
+  filter(!is.na(nfl_id))
+
+# 2. Calculate Euclidean Distance (Separation)
+df_min_separation = df_all_separation %>%
+  mutate(
+    separation_dist = sqrt((receiver_x - defender_x)^2 + (receiver_y - defender_y)^2)
+  ) %>%
+  # 3. Find the Minimum Separation for Each Frame
+  # Group by the unique frame ID (Game, Play, Frame)
+  group_by(game_id, play_id, frame_id) %>%
+  summarise(
+    # Find the minimum separation among all defenders for that frame
+    min_separation = min(separation_dist),
+    # Keep the NFL ID of the closest defender for later analysis
+    closest_defender_id = nfl_id[which.min(separation_dist)][1],
+    .groups = 'drop'
+  )
+
+# Display the first few rows of the minimum separation data
+cat("Dimensions of df_min_separation:", dim(df_min_separation), "\n")
+df_min_separation %>% head() %>% print()
+```
+
+### Calculate the Air-Time Separation Score (ATS-Score) and Merge with Play Data
+```{r}
+# 1. Calculate the ATS-Score (Average Minimum Separation) per Play
+#  ATS-Score = time-averaged minimum separation distance during the pass flight.
+df_ats_score = df_min_separation %>%
+  group_by(game_id, play_id) %>%
+  summarise(
+    # ATS-Score is the time-averaged minimum separation
+    ats_score = mean(min_separation),
+    # Calculate the minimum separation achieved during the entire pass flight
+    min_separation_achieved = min(min_separation),
+    .groups = 'drop'
+  )
+
+# 2. Merge the ATS-Score with the Supplementary Play Data
+# Use an inner_join to keep only the plays for which we successfully calculated an ATS-Score.
+df_ats_analysis = df_plays %>%
+  inner_join(df_ats_score, by = c("game_id", "play_id")) %>%
+  # Filter for plays that resulted in a pass (C, I, IN, S, R) and were not nullified by penalty
+  filter(pass_result %in% c("C", "I", "IN", "S", "R"),
+         play_nullified_by_penalty == "N")
+
+# 3. Clean and categorize the pass results for simpler analysis:
+df_ats_analysis = df_ats_analysis %>%
+  mutate(
+    outcome_category = case_when(
+      pass_result == "C" ~ "Completed",
+      pass_result == "I" ~ "Incomplete",
+      pass_result == "IN" ~ "Interception",
+      # Group Sacks and Scrambles into "Other" since tracking data might be partial for these outcomes
+      TRUE ~ "Other" 
+    ),
+    # Simple binary outcome for completion rate analysis
+    is_completed = ifelse(pass_result == "C", 1, 0)
+  )
+
+# Display dimensions and summary statistics for the final dataset
+cat("Dimensions of df_ats_analysis:", dim(df_ats_analysis), "\n")
+
+df_ats_analysis %>%
+  dplyr::select(game_id, play_id, pass_result, outcome_category, ats_score, min_separation_achieved) %>%
+  head() %>%
+  print()
+
+cat("\nSummary of ATS-Score (yards):\n")
+summary(df_ats_analysis$ats_score) %>% print()
+```
+
+### Analysis 1: ATS-Score by Play Outcome
+Validate the ATS-Score by comparing its distribution across different pass outcomes. The hypthesis is that Completed passes will have a significantly higher average ATS-Score (more separation) than Incomplete passes or Interceptions.
+```{r}
+# 1. Calculate Descriptive Statistics: Mean ATS-Score by Outcome
+ats_summary = df_ats_analysis %>%
+  # Filter only for the primary pass outcomes
+  filter(outcome_category %in% c("Completed", "Incomplete", "Interception")) %>%
+  group_by(outcome_category) %>%
+  summarise(
+    N = n(),
+    Mean_ATS_Score = mean(ats_score),
+    Median_ATS_Score = median(ats_score),
+    .groups = 'drop'
+  )
+
+ats_summary %>% print()
+
+# 2. Visualization: Box Plot of ATS-Score vs. Outcome
+plot_ats_outcome = df_ats_analysis %>%
+  filter(outcome_category %in% c("Completed", "Incomplete", "Interception")) %>%
+  ggplot(aes(x = outcome_category, y = ats_score, fill = outcome_category)) +
+  geom_boxplot(outlier.shape = NA) + # Hide extreme outliers to focus on the bulk of the data
+  scale_fill_manual(values = c("Completed" = "darkgreen", "Incomplete" = "orange", "Interception" = "darkred")) +
+  labs(
+    title = "ATS-Score Distribution by Pass Outcome",
+    subtitle = "ATS-Score: Time-Averaged Minimum Separation During Pass Flight",
+    x = "Pass Outcome",
+    y = "ATS-Score (Yards)",
+    fill = "Outcome"
+  ) +
+  theme_minimal() +
+  # zoom for better readability
+  coord_cartesian(ylim = c(0, 15)) 
+
+print(plot_ats_outcome)
+#ggsave("ats_score_by_outcome_boxplot.png", plot_ats_outcome, width = 8, height = 5)
+```
+The summary and the plot confirms the hypothesis that Completed passes occur when the targeted receiver has significantly more separation during the pass flight.
+
+
+### Analysis 2: ATS-Score vs. Expected Points Added (EPA)
+Next, show how the degree of separation (the ATS-Score) affects the success of a play in terms of its value, which is best measured using the expected_points_added (EPA) column from the supplementary data
+```{r}
+# 1. Filter out non-pass outcomes (Sack/Scramble) as EPA for these are complex and can skew the plot.
+df_epa_analysis = df_ats_analysis %>%
+  filter(outcome_category %in% c("Completed", "Incomplete", "Interception"))
+
+# 2. Create a binned ATS-Score variable for grouped analysis
+df_epa_binned = df_epa_analysis %>%
+  mutate(
+    ats_bin = cut(ats_score, 
+                  breaks = c(0, 1.5, 3.0, 4.5, 6.0, 10, Inf),
+                  labels = c("0-1.5 (Tight)", "1.5-3.0 (Close)", "3.0-4.5 (Open)", "4.5-6.0 (Very Open)", "6.0-10", "10+ (Wide Open)"),
+                  right = FALSE)
+  ) %>%
+  # Filter out extreme EPA outliers (> 5 and < -5) for cleaner visualization
+  filter(expected_points_added >= -5, expected_points_added <= 5)
+
+# 3. Visualization: Mean EPA by ATS-Score Bin
+plot_ats_epa = df_epa_binned %>%
+  group_by(ats_bin) %>%
+  summarise(
+    Mean_EPA = mean(expected_points_added),
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = ats_bin, y = Mean_EPA, fill = Mean_EPA)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "darkred", mid = "lightgray", high = "darkgreen", midpoint = 0) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = "Play Value (EPA) vs. Air-Time Separation Score (ATS)",
+    subtitle = "Higher separation leads to greater positive expected points added.",
+    x = "ATS-Score Bin (Yards of Separation)",
+    y = "Mean Expected Points Added (EPA)",
+    fill = "Mean EPA"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(plot_ats_epa)
+# ggsave("ats_score_vs_epa_bar.png", plot_ats_epa, width = 9, height = 6)
+```
+so far, this plot confirms that ATS-Score is a strong predictor of pass completion
+
+### Analysis 3: Ranking Targeted Receivers by ATS-Score
+Now, calculate the average ATS-Score for every receiver who was targeted. Use the df_input_all data to identify the receiver's name and position and then join it with the df_ats_analysis data.
+```{r}
+# 1. Get receiver name and position from the input data
+df_receiver_info = df_input_all %>%
+  filter(player_role == "Targeted Receiver") %>%
+  # We only need one row per play/receiver for identification
+  distinct(game_id, play_id, nfl_id, player_name, player_position) %>%
+  # Rename nfl_id for clarity
+  rename(receiver_nfl_id = nfl_id)
+
+# 2. Join the ATS-Score with receiver information
+df_receiver_ats = df_ats_analysis %>%
+  left_join(df_receiver_info, by = c("game_id", "play_id"))
+
+# 3. Calculate the average ATS-Score for each receiver (minimum 25 targets)
+df_receiver_ranking = df_receiver_ats %>%
+  # Filter only for Completed or Incomplete passes to focus on plays where the receiver had a chance
+  filter(outcome_category %in% c("Completed", "Incomplete")) %>%
+  group_by(receiver_nfl_id, player_name, player_position) %>%
+  summarise(
+    Total_Targets = n(),
+    Avg_ATS_Score = mean(ats_score),
+    Completion_Rate = sum(is_completed) / n(),
+    .groups = 'drop'
+  ) %>%
+  # Filter for a minimum number of targets to ensure reliability
+  filter(Total_Targets >= 25) %>%
+  arrange(desc(Avg_ATS_Score))
+
+# Display the top 15 receivers ranked by their average ATS-Score
+cat("Top 15 Targeted Receivers by Average ATS-Score (Min. 25 Targets):\n")
+df_receiver_ranking %>%
+  head(15) %>%
+  print()
+
+# bottom 5
+cat("\nBottom 5 Targeted Receivers by Average ATS-Score:\n")
+df_receiver_ranking %>%
+  tail(5) %>%
+  print()
+```
+The top ten receivers by ATS-Score are overwhelmingly Running Backs (RBs). This confirms that RBs, who are targeted on shorter routes against often slower linebackers or in the open field, naturally achieve and maintain greater separation (e.g., Saquon Barkley at 7.57 yards). The metric is validated by the high Completion Rates of the high-ATS players (e.g., Samaje Perine at 0.962) and the low Completion Rates of the low-ATS players (e.g., Quentin Johnston at 0.538$. This confirms that ATS-Score effectively captures the difficulty of the catch opportunity created by the receiver. 
+
+Now, lets move on to the defenders
+
+# Pursuit Efficiency Metric (PEM)
+The Pursuit Efficiency Metric (PEM) quantifies how effectively a defender moves toward the ball landing location versus simply following the receiver. This metric is designed to separate good "man-cover" defenders from efficient "ball-hawks." The formula is $$\text{PEM} = \frac{\text{Distance to Ball Closed (DBC)}}{\text{Distance Traveled (DT)}}$$
+
+Where $\text{DBC}$ is the change in distance to the ball landing location, and $\text{DT}$ (Distance Traveled) is the path length: $$\text{DT} = \sum_{t=1}^{N-1} \sqrt{(\Delta x_t)^2 + (\Delta y_t)^2}$$
+
+### Prepare Data for PEM Calculation
+```{r}
+# 1. Get Play Context (Ball Landing Location and Max Frame)
+df_play_context = df_input_all %>%
+  # Use distinct to get one row per play
+  distinct(game_id, play_id, ball_land_x, ball_land_y, num_frames_output)
+
+# 2. Join Defender Tracking Data with Play Context
+# Use df_defender_tracking (from Chunk 2) which contains x/y for defensive coverage players.
+df_pem_tracking = df_defender_tracking %>%
+  left_join(df_play_context, by = c("game_id", "play_id")) %>%
+  # Remove plays where ball landing location is missing (i.e., not a pass attempt, though this should be rare after earlier filtering)
+  filter(!is.na(ball_land_x))
+
+# 3. Calculate Initial Distance to Ball Landing Spot (at frame_id = 1)
+# This is needed for the Distance to Ball Closed (DBC) part of the metric.
+df_pem_initial_distance = df_pem_tracking %>%
+  filter(frame_id == 1) %>%
+  mutate(
+    initial_dist_to_ball = sqrt((defender_x - ball_land_x)^2 + (defender_y - ball_land_y)^2)
+  ) %>%
+  dplyr::select(game_id, play_id, nfl_id, initial_dist_to_ball)
+
+# 4. Join initial distance back onto the main tracking data
+df_pem_tracking = df_pem_tracking %>%
+  left_join(df_pem_initial_distance, by = c("game_id", "play_id", "nfl_id"))
+
+cat("Dimensions of df_pem_tracking:", dim(df_pem_tracking), "\n")
+df_pem_tracking %>% head() %>% print()
+```
+
+
+### Calculate Distance Traveled (DT) and PEM
+```{r}
+# 1. Calculate Distance Traveled (DT)
+# We need to calculate the frame-to-frame distance for each defender.
+df_distance_traveled = df_pem_tracking %>%
+  # Group by play and player
+  group_by(game_id, play_id, nfl_id) %>%
+  # Arrange by frame_id to ensure correct sequential calculation
+  arrange(frame_id) %>%
+  mutate(
+    # Calculate difference in x and y position from the previous frame (Lag)
+    dx = defender_x - lag(defender_x, default = first(defender_x)),
+    dy = defender_y - lag(defender_y, default = first(defender_y)),
+    # Distance moved in this frame interval
+    dist_moved = sqrt(dx^2 + dy^2)
+  ) %>%
+  # The distance moved in the first frame (frame_id=1) is technically 0, but the lag function handles this by setting dx/dy to 0.
+
+  # 2. Calculate Final Distance to Ball and Aggregate Components
+  summarise(
+    # DT: Total path length during ball flight (sum of dist_moved)
+    dist_traveled = sum(dist_moved),
+    # Final Dist to Ball: Defender's distance to landing spot at the final frame
+    final_dist_to_ball = last(sqrt((defender_x - ball_land_x)^2 + (defender_y - ball_land_y)^2)),
+    # Initial Dist to Ball is already calculated at frame 1 and consistent for the group
+    initial_dist_to_ball = first(initial_dist_to_ball),
+    .groups = 'drop'
+  )
+
+# 3. Calculate PEM
+df_pem_final = df_distance_traveled %>%
+  mutate(
+    # Distance to Ball Closed (DBC)
+    dist_closed = initial_dist_to_ball - final_dist_to_ball,
+    # PEM: DBC / DT (DT must be > 0 to avoid division by zero, use 0 for players who didn't move)
+    pem_score = case_when(
+      dist_traveled > 0 ~ dist_closed / dist_traveled,
+      TRUE ~ 0 # PEM is 0 if no distance was traveled
+    )
+  ) %>%
+  # Filter out players who were too far away to matter (e.g., initial distance > 50 yards)
+  filter(initial_dist_to_ball < 50) 
+
+cat("Top 5 Defender Pursuits by PEM Score:\n")
+df_pem_final %>% 
+  arrange(desc(pem_score)) %>% 
+  head() %>% 
+  print()
+```
+
+### Analysis 4: PEM Validation and Coverage Strategy Comparison
+This analysis validates the PEM by comparing its distribution across pass outcomes and then explores differences in pursuit efficiency based on the defensive strategy (Man vs. Zone coverage). A higher PEM score (closer to 1.0) indicates more efficient pursuit of the ball landing spot.
+```{r}
+# 1. Merge PEM scores with the Supplementary Play Data
+df_pem_analysis = df_pem_final %>%
+  inner_join(df_plays, by = c("game_id", "play_id")) %>%
+  # Apply the same outcome categorization used for ATS-Score
+  mutate(
+    outcome_category = case_when(
+      pass_result == "C" ~ "Completed",
+      pass_result == "I" ~ "Incomplete",
+      pass_result == "IN" ~ "Interception",
+      TRUE ~ "Other" # Handles Sacks/Scrambles
+    )
+  ) %>%
+  # Filter only for plays that are relevant to defense success
+  filter(outcome_category %in% c("Completed", "Incomplete", "Interception"))
+
+# 2. Calculate Mean PEM by Outcome Category (Validation)
+pem_outcome_summary = df_pem_analysis %>%
+  group_by(outcome_category) %>%
+  summarise(
+    N = n(),
+    Mean_PEM = mean(pem_score),
+    Median_PEM = median(pem_score),
+    .groups = 'drop'
+  )
+
+cat("Mean PEM Score by Play Outcome:\n")
+pem_outcome_summary %>% print()
+
+# 3. Calculate Mean PEM by Coverage Strategy (Strategy Analysis)
+pem_coverage_summary = df_pem_analysis %>%
+  filter(team_coverage_man_zone %in% c("MAN_COVERAGE", "ZONE_COVERAGE")) %>%
+  group_by(team_coverage_man_zone) %>%
+  summarise(
+    N = n(),
+    Mean_PEM = mean(pem_score),
+    Median_PEM = median(pem_score),
+    .groups = 'drop'
+  )
+
+cat("\nMean PEM Score by Coverage Strategy:\n")
+pem_coverage_summary %>% print()
+
+# 4. Visualization: Box Plot of PEM vs. Outcome
+plot_pem_outcome = df_pem_analysis %>%
+  ggplot(aes(x = outcome_category, y = pem_score, fill = outcome_category)) +
+  geom_boxplot(outlier.shape = NA) + # Hide outliers for clarity
+  scale_fill_manual(values = c("Completed" = "darkgreen", "Incomplete" = "orange", "Interception" = "darkred")) +
+  labs(
+    title = "PEM Score Distribution by Pass Outcome",
+    subtitle = "PEM: Efficiency of Defender Pursuit Towards Ball Landing Spot",
+    x = "Pass Outcome",
+    y = "PEM Score (0 = Inefficient, 1 = Max Efficiency)",
+    fill = "Outcome"
+  ) +
+  theme_minimal() +
+  # Limit y-axis to focus on the bulk of the data 
+  coord_cartesian(ylim = c(-0.5, 1.5)) 
+
+print(plot_pem_outcome)
+#ggsave("pem_score_by_outcome_boxplot.png", plot_pem_outcome, width = 8, height = 5)
+```
+The metric is validated as intended. Plays where the defense is successful (Incomplete or Interception) feature a significantly higher Mean PEM score. This means that when the defense efficiently tracks the ball's final landing location, they are much more likely to prevent a completion. Also, when looking at the strategies, we see that defenders in ZONE COVERAGE show a significantly higher Mean PEM score (0.432) compared to those in MAN COVERAGE (0.355).
+
+
+### Analysis 5: Ranking Defensive Players by PEM
+```{r}
+# 1. Get defender name and position from the input data
+df_defender_info = df_input_all %>%
+  filter(player_role == "Defensive Coverage") %>%
+  distinct(nfl_id, player_name, player_position)
+
+# 2. Join the PEM Score with defender information
+# Since df_pem_final is player/play level, join this to get the names
+df_defender_pem = df_pem_final %>%
+  inner_join(df_defender_info, by = "nfl_id")
+
+# 3. Calculate the average PEM Score for each defender (minimum 50 plays)
+df_defender_ranking = df_defender_pem %>%
+  group_by(nfl_id, player_name, player_position) %>%
+  summarise(
+    Total_Plays = n(),
+    Avg_PEM_Score = mean(pem_score),
+    .groups = 'drop'
+  ) %>%
+  # Filter for a minimum number of plays to ensure reliability
+  filter(Total_Plays >= 50) %>%
+  arrange(desc(Avg_PEM_Score))
+
+# Display the top 10 defenders ranked by their average PEM Score
+cat("Top 10 Defensive Players by Average PEM Score (Min. 50 Plays):\n")
+df_defender_ranking %>%
+  head(10) %>%
+  print()
+
+# Display the bottom 5
+cat("\nBottom 5 Defensive Players by Average PEM Score:\n")
+df_defender_ranking %>%
+  tail(5) %>%
+  print()
+```
+It seems like players with the highest PEM scores are primarily Linebackers (ILB/MLB) and Safeties (FS/SS) (e.g., Ivan Pace Jr., Jessie Bates). These positions are often responsible for deep zone coverage, which requires them to efficiently pursue the ball's target area. And players with the lowest PEM scores are mainly Cornerbacks (CB) in man coverage (e.g., Shaquill Griffin, Fabian Moreau). Their objective is to maintain proximity to the receiver, often leading to movement that is not directionally efficient toward the final ball location, resulting in a lower PEM.
+
+
+# Spatial Matchup Value (SMV)
+Spatial Matchup Value (SMV), is a powerful composite metric designed to assess the balance of a specific receiver-closest defender matchup. The SMV is calculated simply as the difference between the receiver's separation ability (ATS-Score) and the closest defender's pursuit efficiency (PEM-Score), with the formula:$$\text{SMV} = \text{ATS Score}_{\text{Receiver}} - \text{PEM Score}_{\text{Closest Defender}}$$
+
+A high positive SMV indicates a favorable matchup for the offense (high separation, low defensive efficiency), and a low negative SMV indicates a favorable matchup for the defense
+
+### Calculate Spatial Matchup Value (SMV)
+```{r}
+# 1. Identify the Closest Defender for each play
+# Find the defender associated with the overall minimum separation (min_separation_achieved)
+df_closest_defender_id = df_min_separation %>%
+  group_by(game_id, play_id) %>%
+  # Slice_min takes the row where min_separation is lowest
+  slice_min(min_separation, n = 1, with_ties = FALSE) %>%
+  dplyr::select(game_id, play_id, closest_defender_id)
+
+# 2. Join Closest Defender ID with the ATS Score (play-level offense metric)
+df_matchup_data = df_ats_score %>%
+  inner_join(df_closest_defender_id, by = c("game_id", "play_id"))
+
+# 3. Join the PEM Score of the Closest Defender (player/play-level defense metric)
+# rename nfl_id in df_pem_final to match closest_defender_id for the join.
+df_matchup_data = df_matchup_data %>%
+  inner_join(
+    df_pem_final %>% dplyr::select(game_id, play_id, nfl_id, pem_score),
+    by = c("game_id", "play_id", "closest_defender_id" = "nfl_id")
+  ) %>%
+  rename(closest_defender_pem = pem_score)
+
+# 4. Calculate the Spatial Matchup Value (SMV)
+df_smv_score = df_matchup_data %>%
+  mutate(
+    smv_score = ats_score - closest_defender_pem
+  )
+
+# 5. Analyze SMV by Play Outcome
+smv_summary = df_smv_score %>%
+  inner_join(
+    df_ats_analysis %>% dplyr::select(game_id, play_id, outcome_category),
+    by = c("game_id", "play_id")
+  ) %>%
+  filter(outcome_category %in% c("Completed", "Incomplete", "Interception")) %>%
+  group_by(outcome_category) %>%
+  summarise(
+    N = n(),
+    Mean_SMV = mean(smv_score),
+    Median_SMV = median(smv_score),
+    .groups = 'drop'
+  )
+
+cat("Mean Spatial Matchup Value (SMV) by Play Outcome:\n")
+smv_summary %>% print()
+```
+
+
+
