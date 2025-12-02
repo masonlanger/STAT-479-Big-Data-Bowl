@@ -4,17 +4,23 @@ output: html_document
 ---
 
 # Calculate Air-Time Separation Score (ATS-Score)
+
 The ATS-Score quantifies a receiver's ability to create and maintain separation from the nearest defender while the ball is in the air. It is the time-averaged minimum separation between the targeted receiver and the closest defensive player during the pass flight.
 
 ### Loading and Merging Data
+
 ```{r setup, include=FALSE}
 # Hide setup code when knitting
+set.seed(42)
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 library(tidyverse)
 library(dplyr)
+suppressPackageStartupMessages(require(mgcv))
+suppressPackageStartupMessages(require(lme4))
+suppressPackageStartupMessages(require(ranger))
 
-data_path = "../Datasets" 
+data_path = "../Datasets/train" 
 
 # 1. Load all input tracking data (pre-pass)
 input_files = list.files(
@@ -37,7 +43,7 @@ df_output_all = output_files %>%
   map_dfr(read_csv)
 
 # 3. Load supplementary play data
-df_plays = read_csv(file.path(data_path, "supplementary_data.csv"))
+df_plays = read_csv(file.path('../Datasets', "supplementary_data.csv"))
 
 # Confirm data loading and inspect structure
 cat("Dimensions of df_input_all (all weeks pre-pass data):", dim(df_input_all), "\n")
@@ -48,8 +54,8 @@ cat("Dimensions of df_plays (supplementary data):", dim(df_plays), "\n")
 df_input_all %>% head() %>% print()
 ```
 
-
 ### Prepare Tracking Data for Separation Calculation
+
 ```{r}
 
 # 1. Create a unique play/player ID to help with grouping and joining
@@ -58,7 +64,7 @@ df_output_all = df_output_all %>%
 
 # 2. Extract key player information and roles from the input data.
 # We only need one row per player per play to get their role so using the last frame of the input is sufficient to define player roles/sides.
-df_player_roles = df_input_all %>%
+df_player_roles = df_input_all %>% # players involved in play and their roles
   distinct(game_id, play_id, nfl_id, player_side, player_role) %>%
   # Filter only for the players relevant to the score: Targeted Receiver and Defensive Coverage
   filter(player_role %in% c("Targeted Receiver", "Defensive Coverage"))
@@ -90,7 +96,9 @@ df_receiver_tracking %>% head() %>% print()
 ```
 
 ### Frame-by-Frame Minimum Separation
+
 Join the receiver and defender tracking data, calculates the Euclidean distance (separation) for every receiver-defender pair in every frame, and identifies the minimum separation distance for each frame of every play. The forumula for the distance separation is $$\text{Separation Distance} = \sqrt{(\text{Receiver}_x - \text{Defender}_x)^2 + (\text{Receiver}_y - \text{Defender}_y)^2}$$
+
 ```{r}
 # 1. Join Receiver and Defender Tracking Data
 # This is a Cartesian join based on Game, Play, and Frame, pairing the single receiver position with all defender positions for that moment in time.
@@ -121,6 +129,7 @@ df_min_separation %>% head() %>% print()
 ```
 
 ### Calculate the Air-Time Separation Score (ATS-Score) and Merge with Play Data
+
 ```{r}
 # 1. Calculate the ATS-Score (Average Minimum Separation) per Play
 #  ATS-Score = time-averaged minimum separation distance during the pass flight.
@@ -132,7 +141,8 @@ df_ats_score = df_min_separation %>%
     # Calculate the minimum separation achieved during the entire pass flight
     min_separation_achieved = min(min_separation),
     .groups = 'drop'
-  )
+  ) %>%
+  left_join(df_min_separation %>% select(c(game_id, play_id, min_separation, closest_defender_id)) %>% rename(min_separation_achieved = min_separation), by=c('game_id', 'play_id', 'min_separation_achieved'))
 
 # 2. Merge the ATS-Score with the Supplementary Play Data
 # Use an inner_join to keep only the plays for which we successfully calculated an ATS-Score.
@@ -169,7 +179,9 @@ summary(df_ats_analysis$ats_score) %>% print()
 ```
 
 ### Analysis 1: ATS-Score by Play Outcome
+
 Validate the ATS-Score by comparing its distribution across different pass outcomes. The hypthesis is that Completed passes will have a significantly higher average ATS-Score (more separation) than Incomplete passes or Interceptions.
+
 ```{r}
 # 1. Calculate Descriptive Statistics: Mean ATS-Score by Outcome
 ats_summary = df_ats_analysis %>%
@@ -205,11 +217,13 @@ plot_ats_outcome = df_ats_analysis %>%
 print(plot_ats_outcome)
 #ggsave("ats_score_by_outcome_boxplot.png", plot_ats_outcome, width = 8, height = 5)
 ```
+
 The summary and the plot confirms the hypothesis that Completed passes occur when the targeted receiver has significantly more separation during the pass flight.
 
-
 ### Analysis 2: ATS-Score vs. Expected Points Added (EPA)
+
 Next, show how the degree of separation (the ATS-Score) affects the success of a play in terms of its value, which is best measured using the expected_points_added (EPA) column from the supplementary data
+
 ```{r}
 # 1. Filter out non-pass outcomes (Sack/Scramble) as EPA for these are complex and can skew the plot.
 df_epa_analysis = df_ats_analysis %>%
@@ -250,10 +264,13 @@ plot_ats_epa = df_epa_binned %>%
 print(plot_ats_epa)
 # ggsave("ats_score_vs_epa_bar.png", plot_ats_epa, width = 9, height = 6)
 ```
+
 so far, this plot confirms that ATS-Score is a strong predictor of pass completion
 
 ### Analysis 3: Ranking Targeted Receivers by ATS-Score
+
 Now, calculate the average ATS-Score for every receiver who was targeted. Use the df_input_all data to identify the receiver's name and position and then join it with the df_ats_analysis data.
+
 ```{r}
 # 1. Get receiver name and position from the input data
 df_receiver_info = df_input_all %>%
@@ -294,24 +311,27 @@ df_receiver_ranking %>%
   tail(5) %>%
   print()
 ```
-The top ten receivers by ATS-Score are overwhelmingly Running Backs (RBs). This confirms that RBs, who are targeted on shorter routes against often slower linebackers or in the open field, naturally achieve and maintain greater separation (e.g., Saquon Barkley at 7.57 yards). The metric is validated by the high Completion Rates of the high-ATS players (e.g., Samaje Perine at 0.962) and the low Completion Rates of the low-ATS players (e.g., Quentin Johnston at 0.538$. This confirms that ATS-Score effectively captures the difficulty of the catch opportunity created by the receiver. 
+
+The top ten receivers by ATS-Score are overwhelmingly Running Backs (RBs). This confirms that RBs, who are targeted on shorter routes against often slower linebackers or in the open field, naturally achieve and maintain greater separation (e.g., Saquon Barkley at 7.57 yards). The metric is validated by the high Completion Rates of the high-ATS players (e.g., Samaje Perine at 0.962) and the low Completion Rates of the low-ATS players (e.g., Quentin Johnston at 0.538\$. This confirms that ATS-Score effectively captures the difficulty of the catch opportunity created by the receiver.
 
 Now, lets move on to the defenders
 
 # Pursuit Efficiency Metric (PEM)
+
 The Pursuit Efficiency Metric (PEM) quantifies how effectively a defender moves toward the ball landing location versus simply following the receiver. This metric is designed to separate good "man-cover" defenders from efficient "ball-hawks." The formula is $$\text{PEM} = \frac{\text{Distance to Ball Closed (DBC)}}{\text{Distance Traveled (DT)}}$$
 
 Where $\text{DBC}$ is the change in distance to the ball landing location, and $\text{DT}$ (Distance Traveled) is the path length: $$\text{DT} = \sum_{t=1}^{N-1} \sqrt{(\Delta x_t)^2 + (\Delta y_t)^2}$$
 
 ### Prepare Data for PEM Calculation
+
 ```{r}
 # 1. Get Play Context (Ball Landing Location and Max Frame)
-df_play_context = df_input_all %>%
+df_play_context = df_input_all %>% ## 
   # Use distinct to get one row per play
   distinct(game_id, play_id, ball_land_x, ball_land_y, num_frames_output)
 
 # 2. Join Defender Tracking Data with Play Context
-# Use df_defender_tracking (from Chunk 2) which contains x/y for defensive coverage players.
+# Use df_defender_tracking which contains x/y for defensive coverage players.
 df_pem_tracking = df_defender_tracking %>%
   left_join(df_play_context, by = c("game_id", "play_id")) %>%
   # Remove plays where ball landing location is missing (i.e., not a pass attempt, though this should be rare after earlier filtering)
@@ -334,8 +354,8 @@ cat("Dimensions of df_pem_tracking:", dim(df_pem_tracking), "\n")
 df_pem_tracking %>% head() %>% print()
 ```
 
-
 ### Calculate Distance Traveled (DT) and PEM
+
 ```{r}
 # 1. Calculate Distance Traveled (DT)
 # We need to calculate the frame-to-frame distance for each defender.
@@ -386,7 +406,9 @@ df_pem_final %>%
 ```
 
 ### Analysis 4: PEM Validation and Coverage Strategy Comparison
+
 This analysis validates the PEM by comparing its distribution across pass outcomes and then explores differences in pursuit efficiency based on the defensive strategy (Man vs. Zone coverage). A higher PEM score (closer to 1.0) indicates more efficient pursuit of the ball landing spot.
+
 ```{r}
 # 1. Merge PEM scores with the Supplementary Play Data
 df_pem_analysis = df_pem_final %>%
@@ -449,10 +471,11 @@ plot_pem_outcome = df_pem_analysis %>%
 print(plot_pem_outcome)
 #ggsave("pem_score_by_outcome_boxplot.png", plot_pem_outcome, width = 8, height = 5)
 ```
+
 The metric is validated as intended. Plays where the defense is successful (Incomplete or Interception) feature a significantly higher Mean PEM score. This means that when the defense efficiently tracks the ball's final landing location, they are much more likely to prevent a completion. Also, when looking at the strategies, we see that defenders in ZONE COVERAGE show a significantly higher Mean PEM score (0.432) compared to those in MAN COVERAGE (0.355).
 
-
 ### Analysis 5: Ranking Defensive Players by PEM
+
 ```{r}
 # 1. Get defender name and position from the input data
 df_defender_info = df_input_all %>%
@@ -488,15 +511,17 @@ df_defender_ranking %>%
   tail(5) %>%
   print()
 ```
+
 It seems like players with the highest PEM scores are primarily Linebackers (ILB/MLB) and Safeties (FS/SS) (e.g., Ivan Pace Jr., Jessie Bates). These positions are often responsible for deep zone coverage, which requires them to efficiently pursue the ball's target area. And players with the lowest PEM scores are mainly Cornerbacks (CB) in man coverage (e.g., Shaquill Griffin, Fabian Moreau). Their objective is to maintain proximity to the receiver, often leading to movement that is not directionally efficient toward the final ball location, resulting in a lower PEM.
 
-
 # Spatial Matchup Value (SMV)
+
 Spatial Matchup Value (SMV), is a powerful composite metric designed to assess the balance of a specific receiver-closest defender matchup. The SMV is calculated simply as the difference between the receiver's separation ability (ATS-Score) and the closest defender's pursuit efficiency (PEM-Score), with the formula:$$\text{SMV} = \text{ATS Score}_{\text{Receiver}} - \text{PEM Score}_{\text{Closest Defender}}$$
 
 A high positive SMV indicates a favorable matchup for the offense (high separation, low defensive efficiency), and a low negative SMV indicates a favorable matchup for the defense
 
 ### Calculate Spatial Matchup Value (SMV)
+
 ```{r}
 # 1. Identify the Closest Defender for each play
 # Find the defender associated with the overall minimum separation (min_separation_achieved)
@@ -506,13 +531,9 @@ df_closest_defender_id = df_min_separation %>%
   slice_min(min_separation, n = 1, with_ties = FALSE) %>%
   dplyr::select(game_id, play_id, closest_defender_id)
 
-# 2. Join Closest Defender ID with the ATS Score (play-level offense metric)
-df_matchup_data = df_ats_score %>%
-  inner_join(df_closest_defender_id, by = c("game_id", "play_id"))
-
 # 3. Join the PEM Score of the Closest Defender (player/play-level defense metric)
 # rename nfl_id in df_pem_final to match closest_defender_id for the join.
-df_matchup_data = df_matchup_data %>%
+df_matchup_data = df_ats_score %>%
   inner_join(
     df_pem_final %>% dplyr::select(game_id, play_id, nfl_id, pem_score),
     by = c("game_id", "play_id", "closest_defender_id" = "nfl_id")
@@ -544,5 +565,259 @@ cat("Mean Spatial Matchup Value (SMV) by Play Outcome:\n")
 smv_summary %>% print()
 ```
 
+
+# Multi-Level Model for Completions Prevented Above Replacement
+Using a structure much like that used by Desphande and Wyner, we'll use the metrics defined above, along with the additional provided context of each play, including encodings for defensive alignment, offensive routes, and other play indicators to define a "replacement-level" for defenders, which will then be used to determine which players exceed those replacement-level metrics. The baseline modeling will be done using two methods. First, a standard GLM will be leveraged to define the log-odds of an incompletion for a baseline defender, which will then be used to model player-specific attributes. A similar process will also be done using a Random Forest approach. With these two routes, we'll seek to analyze which players deviate the greatest between the GLM and the Random Forest, and if the two different models produce comparable results when modeling the baseline.
+
+In order to begin modeling, we'll combine several of the data frames composed throughout the derivation of ATS, PEM, and SMV, along with the provided supplementary data. Our response will *outcome_category* used prior, including categories for a completion (encoded as 0), or an incompletion or interception (1). Clearly, an interception intuitively would be worth more, for a defender, than a standard incompletion, but for the sake of this modeling exercise, we'll define a binary category which lumps interceptions into incompletions.
+
+```{r, include=FALSE}
+ats_j = df_ats_analysis %>% select(c('game_id','play_id','ats_score','min_separation_achieved', 'closest_defender_id'))
+pem_j = df_pem_analysis %>% select(c('game_id','play_id','nfl_id','final_dist_to_ball', 'dist_traveled', 'initial_dist_to_ball', 'dist_closed', 'pem_score'))
+smv_j = df_smv_score %>% select(c('game_id','play_id','closest_defender_id', 'smv_score'))
+
+df_total = ats_j %>% left_join(pem_j %>% rename(closest_defender_id = nfl_id), by=c('game_id', 'play_id', 'closest_defender_id')) %>% left_join(smv_j, by=c('game_id', 'play_id', 'closest_defender_id')) %>%
+  select(c('game_id','play_id','closest_defender_id',everything()))
+```
+
+```{r}
+ggplot(df_total %>% group_by(closest_defender_id) %>% count() %>% arrange(desc(n)) , aes(x = n)) +
+  geom_histogram() +
+  labs(
+    title = "Distribution of Targeted Defenders in Provided NFL Data"
+  ) +
+  xlab("Number of Plays") +
+  ylab("Number of Players") + 
+  theme_minimal()
+```
+
+A broad proportion of defenders targeted in the dataset typically have 45 or less targets throughout the dataset, with 54.8% of plays involving players which fall into this category. As such, we'll define 45 plays as our threshold for a "replacement-level" player versus a "top" defender.
+```{r, echo=FALSE}
+sum(df_total %>% group_by(closest_defender_id) %>% count() %>% filter(n < 45) %>% pull(n))
+```
+
+```{r, include=FALSE}
+encoded_plays = df_plays %>% 
+  select(c('game_id','play_id','pass_location_type','route_of_targeted_receiver','defenders_in_the_box', 'team_coverage_type', 'dropback_type', 'pass_result')) %>%
+  mutate(
+    pass_location_type = as.integer(factor(pass_location_type)),
+    route_of_targeted_receiver = as.integer(factor(route_of_targeted_receiver)),
+    team_coverage_type = as.integer(factor(team_coverage_type)),
+    dropback_type = as.integer(factor(dropback_type)),
+    pass_result = case_when(
+      pass_result == 'I' ~ 1,
+      pass_result == 'IN' ~ 1,
+      .default = 0
+    ))
+df_total = df_total %>% 
+  left_join(encoded_plays, by = c('game_id', 'play_id'))
+```
+
+```{r replacing NAs, include=FALSE}
+df_total = df_total %>% mutate(
+  pass_location_type = replace_na(df_total$pass_location_type, as.numeric(which.max(table(df_total$pass_location_type)))),
+  route_of_targeted_receiver = replace_na(df_total$route_of_targeted_receiver, as.numeric(which.max(table(df_total$route_of_targeted_receiver)))),
+  team_coverage_type = replace_na(df_total$team_coverage_type, as.numeric(which.max(table(df_total$team_coverage_type))))
+) 
+```
+Our first approach sees us model the baseline probability that a play ends in an incompletion with an generalized additive model. We'll then do the same estimation with a Random Forest model. From this, we'll compare the two different modeling approaches based on Brier score and Binary Cross-Entropy (BCE) loss.
+```{r}
+# GAM
+hgam_fit = gam(
+  formula = pass_result ~ ats_score + min_separation_achieved + final_dist_to_ball +
+    dist_traveled + initial_dist_to_ball + dist_closed + pem_score + smv_score + pass_location_type +
+    route_of_targeted_receiver + defenders_in_the_box + team_coverage_type + dropback_type,
+  data = df_total, family = binomial(link="logit"))
+gam_baseline = predict(hgam_fit, newdata = df_total, type="response")
+# Example output with GAM baseline predictions
+df_total %>% 
+  mutate(
+    baseline_gam_prob = gam_baseline
+  ) %>%
+  select(c(game_id, play_id, ats_score, smv_score, pass_result, baseline_gam_prob)) %>%
+  head(10)
+```
+
+```{r}
+rf_fit <- ranger(
+  formula = pass_result ~ ats_score + min_separation_achieved + final_dist_to_ball +
+    dist_traveled + initial_dist_to_ball + dist_closed + pem_score + smv_score + pass_location_type +
+    route_of_targeted_receiver + defenders_in_the_box + team_coverage_type + dropback_type,
+  data = df_total,
+  probability = TRUE,  # Essential for getting probabilities instead of classes
+  num.trees = 250,
+  importance = "impurity",  # Optional: to get variable importance
+  seed = 42
+)
+
+rf_baseline = predict(rf_fit, data = df_total, type="response")$predictions[,2]
+model_comp = df_total %>% 
+  mutate(
+    baseline_gam_prob = gam_baseline,
+    baseline_rf_prob = rf_baseline
+  ) %>%
+  select(c(game_id, play_id, ats_score, smv_score, pass_result, baseline_gam_prob, baseline_rf_prob))
+model_comp %>%
+  head(10)
+```
+
+```{r}
+print(str_c("Binary Cross-Entropy loss with GAM approach: ", as.character(round(mean(model_comp %>%
+  mutate(bce_loss = -((pass_result*log(baseline_gam_prob))+((1-pass_result)*log(1-baseline_gam_prob)))) %>% pull(bce_loss)), 4))))
+print(str_c("Brier loss with GAM approach: ", as.character(round(mean(model_comp %>%
+  mutate(brier_loss_gam = (baseline_gam_prob - pass_result)^2) %>% pull(brier_loss_gam)), 4))))
+
+print(str_c("Binary Cross-Entropy loss with Random Forest approach: ", as.character(round(mean(model_comp %>%
+  mutate(bce_loss = -((pass_result*log(baseline_rf_prob))+((1-pass_result)*log(1-baseline_rf_prob)))) %>% pull(bce_loss)), 4))))
+print(str_c("Brier loss with Random Forest approach: ", as.character(round(mean(model_comp %>%
+  mutate(brier_loss_rf = (baseline_rf_prob - pass_result)^2) %>% pull(brier_loss_rf)), 4))))
+```
+
+From the results above, we see that the Random Forest approach outperforms the GAM model when estimating the probability of an incompletion. Particularly, the Random Forest model stands out in regard to BCE loss, with 0.21 compared to 0.54 with the GAM approach. This trend is seen in the Brier score as well, with 0.05 compared to 0.176. This motivates our choice to move forward with the baseline estimations provided by the Random Forest classifier; however, we'll see later that this actually results in somewhat unreasonable results when compared to what we get with GAM baselines. 
+
+With that said, we can now use these baseline values with the defender IDs to draw out player-specifc responses, alongside team-level play attributes like the coverage type of the defense and the route that the target receiver is running.
+
+```{r}
+df_total_w_baseline = df_total %>%
+  mutate(
+    baseline = rf_baseline
+  )
+# Multi-level model with baseline projections and player interactions 
+multilevel_fit <-
+  glmer(formula = pass_result ~ 1 + (1 | closest_defender_id) + (1 | team_coverage_type) + (1 | route_of_targeted_receiver) + baseline,
+        family = binomial(link = "logit"), # get logits
+        data = df_total_w_baseline)
+```
+
+
+We'll now extract the deviations for each *closest_defender_id* that we applied our multi-level model to, and then calculate the replacement-level probability of an incompletion and the player's probability of causing an incompletion based on their deviation. From this, we'll find the difference between the two calculations, highlighting a defender's performance above/below a replacement-level player.
+```{r, echo=FALSE}
+tmp = ranef(multilevel_fit)
+inc_u <- 
+  data.frame(
+    defender = as.integer(rownames(tmp[["closest_defender_id"]])),
+    u = tmp[['closest_defender_id']][,1]
+  )
+
+def_counts = df_total %>% 
+  group_by(closest_defender_id) %>%
+  count() %>%
+  mutate(n = as.numeric(n)) %>%
+  rename(defender = closest_defender_id)
+inc_u = inc_u %>%
+  left_join(def_counts, by = 'defender')
+threshold = 45
+
+top_u = inc_u %>% 
+  filter(n >= threshold)
+
+repl_u = inc_u %>% 
+  filter(n < threshold) %>% 
+  pull(u) %>%
+  mean() # get average deviation for all replacement-level players
+print(str_c("Deviation of replacement-level defender: ", as.character(repl_u)))
+```
+
+```{r}
+preds = predict(object = multilevel_fit,
+        newdata = df_total_w_baseline,
+        type = "link")
+inc_or = df_total_w_baseline %>% mutate(log_odds = preds)
+
+inc_or = inc_or |>
+  dplyr::left_join(inc_u %>%
+                     dplyr::select(defender, u) %>%
+                     rename(closest_defender_id = defender),
+                   by = "closest_defender_id") %>%
+  rename(defender = closest_defender_id) %>%
+  dplyr::mutate(repl_log_odds = log_odds - u + repl_u) 
+inc_or =
+  inc_or %>%
+  dplyr::mutate(
+    fitted_prob = 1/(1 + exp(-1 * log_odds)), # converting log-odds to probabilities
+    repl_prob = 1/(1 + exp(-1 * repl_log_odds)), # computing counter-factual probabilities
+    value = fitted_prob - repl_prob # simple
+  )
+```
+
+```{r, echo=FALSE}
+inc_or_defender_rank = inc_or %>%
+  group_by(defender) %>%
+  summarise(value = sum(value), .groups = 'drop') %>%
+  arrange(desc(value)) %>%
+  left_join(df_defender_info %>% rename(defender = nfl_id), by='defender')
+inc_or_defender_rank %>%
+  select(-c('defender')) %>%
+  select(c(player_name, player_position, value)) %>%
+  head(20)
+```
+
+These initial findings, motivated by the Random Forest baselines, provide some interesting results. While we do see some reputable cornerbacks like Denzel Ward and other defensive players like Demario Davis and Roquan Smith within the top 20 defenders rated by our estimated value over replacement, the bulk of the players do not stand out as players we would expect to see on first glance. Let's compare this with what we would see if used the GAM-provided baselines instead.
+
+```{r, echo=FALSE}
+df_total_w_baseline = df_total %>%
+  mutate(
+    baseline = gam_baseline
+  )
+# Multi-level model with baseline projections and player interactions 
+multilevel_fit <-
+  glmer(formula = pass_result ~ 1 + (1 | closest_defender_id) + (1 | team_coverage_type) + (1 | route_of_targeted_receiver) + baseline,
+        family = binomial(link = "logit"), # get logits
+        data = df_total_w_baseline)
+tmp = ranef(multilevel_fit)
+inc_u <- 
+  data.frame(
+    defender = as.integer(rownames(tmp[["closest_defender_id"]])),
+    u = tmp[['closest_defender_id']][,1]
+  )
+
+def_counts = df_total %>% 
+  group_by(closest_defender_id) %>%
+  count() %>%
+  mutate(n = as.numeric(n)) %>%
+  rename(defender = closest_defender_id)
+inc_u = inc_u %>%
+  left_join(def_counts, by = 'defender')
+threshold = 45
+
+top_u = inc_u %>% 
+  filter(n >= threshold)
+
+repl_u = inc_u %>% 
+  filter(n < threshold) %>% 
+  pull(u) %>%
+  mean() # get average deviation for all replacement-level players
+print(str_c("Deviation of replacement-level defender: ", as.character(repl_u)))
+preds = predict(object = multilevel_fit,
+        newdata = df_total_w_baseline,
+        type = "link")
+inc_or = df_total_w_baseline %>% mutate(log_odds = preds)
+
+inc_or = inc_or |>
+  dplyr::left_join(inc_u %>%
+                     dplyr::select(defender, u) %>%
+                     rename(closest_defender_id = defender),
+                   by = "closest_defender_id") %>%
+  rename(defender = closest_defender_id) %>%
+  dplyr::mutate(repl_log_odds = log_odds - u + repl_u) 
+inc_or =
+  inc_or %>%
+  dplyr::mutate(
+    fitted_prob = 1/(1 + exp(-1 * log_odds)), # converting log-odds to probabilities
+    repl_prob = 1/(1 + exp(-1 * repl_log_odds)), # computing counter-factual probabilities
+    value = fitted_prob - repl_prob # simple
+  )
+inc_or_defender_rank = inc_or %>%
+  group_by(defender) %>%
+  summarise(value = sum(value), .groups = 'drop') %>%
+  arrange(desc(value)) %>%
+  left_join(df_defender_info %>% rename(defender = nfl_id), by='defender')
+inc_or_defender_rank %>%
+  select(-c('defender')) %>%
+  select(c(player_name, player_position, value)) %>%
+  head(20)
+```
+
+Using the GAM baselines instead, our findings now indicate some well-known cornerbacks and safeties as performing among the best when compared to a replacement-level player in coverage. Primarily, the top ten players constitute 13 Pro Bowls, 4 AP DPOY shares, and 3 All-Pro team selections, with Stephon Gilmore, DaRon Bland, and Devon Witherspoon leading the way (FBRef). While these findings seem subjectively better than the Random Forest-motivated results, our findings could still certainly be improved by determining a better metric for an incompletion's value, given the play's context, like field position, in-game time, and score differential. Right now, we're simply defining an incompletion's value as 1, but if we pivot to modeling the "swing" in a game based on an incompletion, we can then apply this to our earlier model to get a true estimate of *points saved above replacement*.
 
 
